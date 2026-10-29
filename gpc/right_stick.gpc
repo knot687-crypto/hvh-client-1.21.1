@@ -1,0 +1,559 @@
+/* =============================================================================
+ *  RIGHT STICK : zero-tunable precision conditioner          Cronus Zen (GPC)
+ * =============================================================================
+ *  No tunable values.  Every constant is derived (tools/derive.py) or is a
+ *  documented property of the Zen; nothing is adjusted per game.
+ *
+ *  What it does
+ *    The Zen's classic stick channel (PS4_RX / PS4_RY) is quantised to whole
+ *    percent.  The polar channel (get_ipolar) carries the same stick with a
+ *    radius resolution of 1/32767.  This script fuses the two into a 0.01 %
+ *    estimate of the physical stick and writes it back through the 1 %
+ *    channel with a noise-shaping quantiser.  The running sum of output
+ *    error stays below one step, so over N cycles the average is exact to
+ *    within 1/N %: the camera turns at the sub-percent rate being held.
+ *    It adds no aim assist, no anti-recoil, no response curve and no
+ *    prediction.  Each output is one of the two whole percents around the
+ *    fused value.  The stick reads exactly 0 when released.
+ *
+ *  Signal path (one VM cycle, 10 ms by default)
+ *    1  timing   get_rtime -> cross-ratio uniformity test      (discrete delay)
+ *    2  sensors  integer cell + polar arc -> slab fusion        (voxel ray)
+ *                with bounded-error identification of the Zen's conventions
+ *    3  dither   8x8 blue-noise mask read by two golden voxel rays, restarted
+ *                every stroke from entropy harvested off the stick (Kolmogorov)
+ *    4  output   Smith-predictor error-feedback two-level quantiser
+ *                (deadbeat gain from the Bellman equation, Bode-limited)
+ *
+ *  Where each requested concept is used.  Run = on the device;
+ *  design = derivation and verification in tools/derive.py (see README.md).
+ *    Curse of dimensionality  run     the state vector below is kept per axis;
+ *                                     the joint 2-axis Bellman problem has zero
+ *                                     cross term, so no joint table is needed
+ *    Bellman equations        design  minimum-variance law for the integrated
+ *                                     camera error: p = 0, gain k = 1 (deadbeat)
+ *    HJB                      design  same problem in continuous time: gain
+ *                                     1/sqrt(mu) -> infinity with no delay; the
+ *                                     one-cycle delay leaves the residual
+ *    Control theory           run     closed error loop, |e| < 1 step, zero DC
+ *                                     error
+ *    Smith predictor          run     plant = z^-1 * quantiser, model = z^-1;
+ *                                     mismatch feedback == error feedback
+ *    Discrete delay           run     the z^-1 of that loop; get_rtime timebase
+ *    Bode integral theorem    design  NTF S(z) = 1 - z^-1 has
+ *                                     integral_0^pi ln|S| dw = 0: error removed
+ *                                     below fs/6 reappears above it
+ *    PSD                      design  output error spectrum rises 17-19 dB per
+ *                                     decade (ideal 20) and is zero at DC
+ *    Poisson-disk             design  mask ranks 0..3 = the maximal r = 4 set on
+ *                                     the 8x8 torus: (0,0) (4,0) (2,4) (6,4);
+ *                                     ranks 0..7 >= 2 apart, 0..15 >= sqrt 2
+ *    8x8 mask                 run     RS_MASK, 64-level dither matrix
+ *    Blue noise, radius 4     design  mask annealed for 2-D blue noise
+ *                                     (Georgiev-Fajardo energy) on that seed
+ *    Voxel ray                run     (a) Amanatides-Woo DDA through the mask,
+ *                                     slope 1/phi  (b) Kay-Kajiya slab test
+ *                                     along the polar arc in the fusion
+ *    Cross ratio              run     (t0,t1;t2,t3) = 4/3 for evenly spaced
+ *                                     samples at any period
+ *    Kolmogorov randomness    run     no program can emit an incompressible
+ *                                     sequence; ray restarts take their phase
+ *                                     from entropy harvested off the stick
+ *    Cramer-Rao               design  a still whole-percent reading carries zero
+ *                                     Fisher information inside its cell, so the
+ *                                     polar channel is required; bounded-error
+ *                                     identification replaces CRB statistics
+ *    ADMM                     design  solves the l1-constrained noise-shaping
+ *                                     QP (optimum 1 - z^-1) and the rejected
+ *                                     window estimator; not run on the device
+ *    Clairaut                 design  symmetric Hessian -> one eigensolve for
+ *                                     every ADMM penalty, and a symmetric 2-axis
+ *                                     Riccati matrix with zero cross term
+ *
+ *  Needs 32-bit Zen firmware (get_ipolar).  Paste into Zen Studio, compile,
+ *  program a slot.  The left stick and all buttons pass through untouched.
+ * ========================================================================== */
+
+// ---------------------------------------------------------------- definitions
+define RS_Q          = 100;         // working unit: 1 % of travel = 100
+define RS_POL_FULL   = 32767;       // get_ipolar radius at full deflection
+define RS_SIN05      = 143;         // ceil(16384 * sin 0.5 deg) = ceil(142.99)
+define RS_SIN1       = 286;         // ceil(16384 * sin 1 deg)   = ceil(285.94)
+define RS_SLACK      = 4;           // fusion error budget, 0.01 % units:
+                                    // radius 0.65 + table 0.44 + p0 0.5
+                                    // + arc vs tangent 1.52 = 3.11 -> 4
+define RS_NHYP       = 6;           // 2 angle x 3 integer conventions
+define RS_DTX        = 65536;       // voxel ray tDeltaX = 1   (Q16)
+define RS_DTY        = 106039;      // voxel ray tDeltaY = phi (Q16, 106039.48)
+define RS_PM_M       = 2147483647;  // Park-Miller modulus 2^31 - 1 (prime)
+define RS_PM_A       = 16807;       // Park-Miller multiplier 7^5
+define RS_PM_Q       = 127773;      // RS_PM_M / RS_PM_A (Schrage)
+define RS_PM_R       = 2836;        // RS_PM_M % RS_PM_A (Schrage)
+define RS_ST_UNKNOWN = 0;           // polar channel not yet confirmed
+define RS_ST_VALID   = 1;           // polar channel confirmed
+define RS_ST_INVALID = 2;           // polar channel refuted: pass-through
+
+// ---------------------------------------------------------------- const data
+// 8x8 blue-noise dither mask, ranks 0..63, row = y, column = x.
+const uint8 RS_MASK[][] = {
+    {  0, 55, 52, 28,  1, 16, 60, 38 },
+    { 33, 15, 47, 14, 44, 56,  8, 20 },
+    { 45, 18, 10, 63, 23,  5, 54, 46 },
+    {  6, 51, 57,  9, 37, 32, 27, 36 },
+    { 61, 25,  2, 42, 39, 58,  3, 22 },
+    { 13, 40, 26, 35, 21, 11, 53, 43 },
+    { 24, 59, 50,  4, 31, 62, 19,  7 },
+    { 48, 12, 17, 49, 29, 41, 34, 30 }
+};
+
+// cos(0..90 deg) * 16384, rounded.
+const int16 RS_COS[] = {
+    16384, 16382, 16374, 16362, 16344, 16322, 16294, 16262, 16225, 16182,
+    16135, 16083, 16026, 15964, 15897, 15826, 15749, 15668, 15582, 15491,
+    15396, 15296, 15191, 15082, 14968, 14849, 14726, 14598, 14466, 14330,
+    14189, 14044, 13894, 13741, 13583, 13421, 13255, 13085, 12911, 12733,
+    12551, 12365, 12176, 11982, 11786, 11585, 11381, 11174, 10963, 10749,
+    10531, 10311, 10087,  9860,  9630,  9397,  9162,  8923,  8682,  8438,
+     8192,  7943,  7692,  7438,  7182,  6924,  6664,  6402,  6138,  5872,
+     5604,  5334,  5063,  4790,  4516,  4240,  3964,  3686,  3406,  3126,
+     2845,  2563,  2280,  1997,  1713,  1428,  1143,   857,   572,   286,
+        0
+};
+
+// ---------------------------------------------------------------- state
+// The state vector (the "curse of dimensionality" vector).  It is all the
+// controller remembers; the error states are per axis because the optimal
+// policy factorises:
+//   smith_m[2]                    integrated error = Smith mismatch
+//   ray_cx[2] ray_cy[2] ray_d[2]  two voxel-ray positions
+//   rng                           entropy pool / Park-Miller state
+//   dt0 dt1 dt2                   last three VM intervals
+//   pol_state, hyp_alive[6]       polar validation, live conventions
+int smith_m[2];
+int ray_cx[2];
+int ray_cy[2];
+int ray_d[2];
+int rng;
+int dt0, dt1, dt2;
+int pol_state;
+int hyp_alive[6];
+int resting;
+
+// per-cycle signals
+int zx, zy;             // integer channel, percent
+int pr, pa;             // polar radius 0..32767, polar angle 0..359 deg
+int vx, vy;             // targets, 0.01 %
+int ox, oy;             // outputs, percent
+int t_uniform;          // cross-ratio test result
+int fuse_ok;            // 1 fused, 0 not applicable, -1 inconsistent
+int fz_x, fz_y;         // fused position, 0.01 %
+int tau_x, tau_y;       // dither thresholds 1..99
+
+// scratch: GPC has no local variables, so each helper owns its own
+int f_rho, f_c, f_s, f_px, f_py, f_tx, f_ty, f_u05, f_u1;
+int f_h, f_any, f_lo, f_hi, f_clo, f_chi, f_hlo, f_hhi, f_t;
+int w_lo, w_hi;
+int s_clo, s_chi, s_bl, s_bh, s_m, s_n;
+int q_fl, q_fr, q_w, q_y;
+int k_hi, k_lo, k_t;
+int cr_lo, cr_hi;
+int r_row, r_col;
+int i;
+
+// ---------------------------------------------------------------- init
+init {
+    rng = 1043618065;               // any value in [1, 2^31 - 2]
+    rs_reseed_rays();
+    dt0 = 10;
+    dt1 = 10;
+    dt2 = 10;
+    pol_state = RS_ST_UNKNOWN;
+    for (i = 0; i < RS_NHYP; i++) {
+        hyp_alive[i] = 1;
+    }
+    resting = 1;
+}
+
+// ---------------------------------------------------------------- main
+main {
+    // 1. discrete-time model: the last three sample intervals
+    dt0 = dt1;
+    dt1 = dt2;
+    dt2 = get_rtime();
+    if (dt2 < 1) {
+        dt2 = 1;
+    }
+    if (dt2 > 1000) {
+        dt2 = 1000;                 // overflow guard; fails the test anyway
+    }
+    t_uniform = rs_uniform_timing(dt0, dt1, dt2);
+
+    // 2. both views of the physical right stick
+    zx = get_ival(PS4_RX);
+    zy = get_ival(PS4_RY);
+    pr = get_ipolar(POLAR_RS, POLAR_RADIUS);
+    pa = get_ipolar(POLAR_RS, POLAR_ANGLE);
+
+    if (zx == 0 && zy == 0) {
+        // released stick: exact zero, integrated error cleared
+        ox = 0;
+        oy = 0;
+        vx = 0;
+        vy = 0;
+        smith_m[0] = 0;
+        smith_m[1] = 0;
+        resting = 1;
+    } else {
+        if (resting) {
+            rs_reseed_rays();       // new stroke: new random ray phase
+            resting = 0;
+        }
+        rs_harvest();
+
+        // 3. sensor fusion, validated against the integer cell
+        vx = zx * RS_Q;
+        vy = zy * RS_Q;
+        fuse_ok = 0;
+        if (pol_state != RS_ST_INVALID) {
+            rs_fuse();
+            if (fuse_ok == -1 && rs_decisive()) {
+                pol_state = RS_ST_INVALID;
+            }
+            if (fuse_ok == 1 && pol_state == RS_ST_UNKNOWN && rs_decisive()) {
+                pol_state = RS_ST_VALID;
+            }
+            if (fuse_ok == 1 && pol_state == RS_ST_VALID) {
+                vx = fz_x;
+                vy = fz_y;
+            }
+        }
+        if (vx > 10000) {
+            vx = 10000;
+        }
+        if (vx < -10000) {
+            vx = -10000;
+        }
+        if (vy > 10000) {
+            vy = 10000;
+        }
+        if (vy < -10000) {
+            vy = -10000;
+        }
+
+        // 4. dither thresholds from the blue-noise mask along two voxel rays
+        rs_advance_rays();
+
+        // 5. uniform-delay model broken -> discard the integrated state
+        if (!t_uniform) {
+            smith_m[0] = 0;
+            smith_m[1] = 0;
+        }
+
+        // 6. Smith-predictor error-feedback quantiser, one per axis
+        ox = rs_quantise(0, vx, tau_x);
+        oy = rs_quantise(1, vy, tau_y);
+    }
+
+    set_val(PS4_RX, ox);
+    set_val(PS4_RY, oy);
+
+    // Device Monitor diagnostics
+    set_val(TRACE_1, vx);                           // X target, 0.01 %
+    set_val(TRACE_2, vy);                           // Y target, 0.01 %
+    set_val(TRACE_3, pol_state * 10 + t_uniform);
+    set_val(TRACE_4, smith_m[0]);                   // integrated X error
+    set_val(TRACE_5, smith_m[1]);                   // integrated Y error
+    set_val(TRACE_6, rs_live_hypotheses());         // conventions still open
+}
+
+// ---------------------------------------------------------------- functions
+
+// Smith predictor around a two-level quantiser (= error feedback).
+//   plant  : y[n] = Q(w[n]), transmitted once per VM cycle
+//   model  : ideal transmission of w[n]
+//   smith_m: measured output - model output, available one cycle later
+//   primary controller (Bellman minimum variance, deadbeat):
+//            w = v - smith_m
+// The output is always floor(v) or floor(v) + 1, and |smith_m| < 100.
+function rs_quantise(p_ax, p_v, p_tau) {
+    q_fl = rs_floor_div(p_v, RS_Q);
+    q_fr = p_v - q_fl * RS_Q;
+    if (q_fr == 0) {
+        return q_fl;                    // exact value: mismatch unchanged
+    }
+    q_w = p_v - smith_m[p_ax];
+    q_y = q_fl;
+    if (q_w - q_fl * RS_Q >= p_tau) {
+        q_y = q_fl + 1;
+    }
+    smith_m[p_ax] = q_y * RS_Q - q_w;
+    return q_y;
+}
+
+// Fuse the polar reading with the integer cell.
+//   p0 = rho (cos a, -sin a) is exact in radius; the true point lies on the
+//   arc around it, parametrised by t along the tangent (a voxel ray).
+//   Six hypotheses about how the Zen rounds: angle {rounded, truncated} x
+//   integer reading {rounded, truncated toward 0, floored}.  For each live
+//   one, intersect its t-window with the two cell slabs (Kay-Kajiya).  An
+//   empty intersection proves the hypothesis false for good.  The estimate
+//   is the centre of the hull of the surviving intervals: the Chebyshev
+//   centre of the exact feasible set once one hypothesis is left.
+function rs_fuse() {
+    if (pr >= RS_POL_FULL || abs(zx) >= 100 || abs(zy) >= 100) {
+        fuse_ok = 0;                    // radius or an axis is saturated
+    } else {
+        f_rho = (pr * 10000 + 16383) / 32767;
+        f_c = rs_cos(pa);
+        f_s = rs_cos(pa + 270);         // sin a = cos(a - 90 deg)
+        f_px = rs_rdiv(f_rho * f_c, 16384);
+        f_py = -rs_rdiv(f_rho * f_s, 16384);
+        f_tx = -f_s;                    // d/da (cos a, -sin a)
+        f_ty = -f_c;
+        f_u05 = (f_rho * RS_SIN05 + 16383) / 16384 + RS_SLACK;
+        f_u1 = (f_rho * RS_SIN1 + 16383) / 16384 + RS_SLACK;
+        f_any = 0;
+        f_hlo = 0;
+        f_hhi = 0;
+        for (f_h = 0; f_h < 3; f_h++) {
+            // integer convention f_h: cell slabs computed once, then
+            // intersected with both angle windows (hypotheses f_h, f_h + 3)
+            if (hyp_alive[f_h] || hyp_alive[f_h + 3]) {
+                f_lo = -f_u1;           // hull of both angle windows
+                f_hi = f_u1;
+                rs_slab(f_px, f_tx, zx, f_h);
+                rs_slab(f_py, f_ty, zy, f_h);
+                f_clo = f_lo;
+                f_chi = f_hi;
+                if (hyp_alive[f_h]) {
+                    rs_window(f_h, -f_u05, f_u05);          // angle rounded
+                }
+                if (hyp_alive[f_h + 3]) {
+                    rs_window(f_h + 3, -RS_SLACK, f_u1);    // angle truncated
+                }
+            }
+        }
+        if (f_any == 0) {
+            fuse_ok = -1;
+        } else {
+            f_t = rs_floor_div(f_hlo + f_hhi, 2);
+            fz_x = f_px + rs_rdiv(f_t * f_tx, 16384);
+            fz_y = f_py + rs_rdiv(f_t * f_ty, 16384);
+            fuse_ok = 1;
+        }
+    }
+}
+
+// Intersect the cell-feasible interval [f_clo, f_chi] with angle window
+// [p_wlo, p_whi] for hypothesis p_h; empty -> the hypothesis is refuted,
+// otherwise it widens the hull of feasible intervals.
+function rs_window(p_h, p_wlo, p_whi) {
+    w_lo = f_clo;
+    w_hi = f_chi;
+    if (p_wlo > w_lo) {
+        w_lo = p_wlo;
+    }
+    if (p_whi < w_hi) {
+        w_hi = p_whi;
+    }
+    if (w_lo > w_hi) {
+        hyp_alive[p_h] = 0;
+    } else {
+        if (f_any == 0 || w_lo < f_hlo) {
+            f_hlo = w_lo;
+        }
+        if (f_any == 0 || w_hi > f_hhi) {
+            f_hhi = w_hi;
+        }
+        f_any = 1;
+    }
+}
+
+// One slab of the ray/box test for integer convention p_conv:
+//   keep t with  cell_lo - SLACK <= p + t * dir / 16384 - 100 z <= cell_hi + SLACK
+function rs_slab(p_p, p_dir, p_z, p_conv) {
+    s_clo = -50;                        // rounded: [-0.5, +0.5] %
+    s_chi = 50;
+    if (p_conv == 1) {                  // truncated toward zero
+        if (p_z > 0) {
+            s_clo = 0;
+            s_chi = 100;
+        } else if (p_z < 0) {
+            s_clo = -100;
+            s_chi = 0;
+        } else {
+            s_clo = -100;
+            s_chi = 100;
+        }
+    }
+    if (p_conv == 2) {                  // floored
+        s_clo = 0;
+        s_chi = 100;
+    }
+    s_bl = p_z * RS_Q + s_clo - RS_SLACK - p_p;
+    s_bh = p_z * RS_Q + s_chi + RS_SLACK - p_p;
+    if (p_dir == 0) {
+        if (s_bl > 0 || s_bh < 0) {
+            f_lo = 1;                   // empty
+            f_hi = 0;
+        }
+    } else {
+        s_m = abs(p_dir);
+        if (p_dir > 0) {
+            s_n = rs_ceil_div(s_bl * 16384, s_m);
+            if (s_n > f_lo) {
+                f_lo = s_n;
+            }
+            s_n = rs_floor_div(s_bh * 16384, s_m);
+            if (s_n < f_hi) {
+                f_hi = s_n;
+            }
+        } else {
+            s_n = rs_ceil_div(-s_bh * 16384, s_m);
+            if (s_n > f_lo) {
+                f_lo = s_n;
+            }
+            s_n = rs_floor_div(-s_bl * 16384, s_m);
+            if (s_n < f_hi) {
+                f_hi = s_n;
+            }
+        }
+    }
+}
+
+// A sample is decisive when a wrong polar convention could not hide inside
+// the integer cells.
+function rs_decisive() {
+    if (abs(zx) + abs(zy) >= 3) {
+        return 1;
+    }
+    return 0;
+}
+
+function rs_live_hypotheses() {
+    return hyp_alive[0] + hyp_alive[1] + hyp_alive[2] + hyp_alive[3] + hyp_alive[4] + hyp_alive[5];
+}
+
+// Two Amanatides-Woo rays through the torus-wrapped mask.
+//   ray 0 (X axis) direction (1, 1/phi), ray 1 (Y axis) direction (-1/phi, 1)
+//   ray_d = tMax(fast axis) - tMax(slow axis), kept in [-RS_DTY, RS_DTX)
+function rs_advance_rays() {
+    if (ray_d[0] < 0) {
+        ray_cx[0] = (ray_cx[0] + 1) % 8;
+        ray_d[0] = ray_d[0] + RS_DTX;
+    } else {
+        ray_cy[0] = (ray_cy[0] + 1) % 8;
+        ray_d[0] = ray_d[0] - RS_DTY;
+    }
+    if (ray_d[1] < 0) {
+        ray_cy[1] = (ray_cy[1] + 1) % 8;
+        ray_d[1] = ray_d[1] + RS_DTX;
+    } else {
+        ray_cx[1] = (ray_cx[1] + 7) % 8;
+        ray_d[1] = ray_d[1] - RS_DTY;
+    }
+    r_row = ray_cy[0];
+    r_col = ray_cx[0];
+    tau_x = (RS_MASK[r_row][r_col] * RS_Q + 82) / 64;
+    r_row = ray_cy[1];
+    r_col = ray_cx[1];
+    tau_y = (RS_MASK[r_row][r_col] * RS_Q + 82) / 64;
+}
+
+// Restart both rays at a random cell and phase.
+function rs_reseed_rays() {
+    for (i = 0; i < 2; i++) {
+        rs_pm_step();
+        ray_cx[i] = rng % 8;
+        ray_cy[i] = (rng / 8) % 8;
+        ray_d[i] = (rng / 64) % (RS_DTX + RS_DTY) - RS_DTY;
+    }
+}
+
+// Fold this cycle's raw readings and timing into the entropy pool.
+function rs_harvest() {
+    rs_mix(pr * 361 + pa);
+    rs_mix((zx + 101) * 203 + (zy + 101) + dt2 * 41209);
+}
+
+// rng = (rng + k) mod (2^31 - 1), then one generator step; never overflows.
+function rs_mix(p_k) {
+    if (rng >= RS_PM_M - p_k) {
+        rng = rng - (RS_PM_M - p_k);
+    } else {
+        rng = rng + p_k;
+    }
+    if (rng == 0) {
+        rng = 1;
+    }
+    rs_pm_step();
+}
+
+// Park-Miller minimal standard generator by Schrage's method (no overflow).
+function rs_pm_step() {
+    k_hi = rng / RS_PM_Q;
+    k_lo = rng - k_hi * RS_PM_Q;
+    k_t = RS_PM_A * k_lo - RS_PM_R * k_hi;
+    if (k_t <= 0) {
+        k_t = k_t + RS_PM_M;
+    }
+    rng = k_t;
+}
+
+// Cross-ratio test of the last three intervals a, b, c (sample times 0, a,
+// a+b, a+b+c).  Evenly spaced samples give CR = 4/3 at any period, i.e.
+// F = 3(a+b)(b+c) - 4b(a+b+c) = 0.  get_rtime() counts whole milliseconds,
+// so pass when F = 0 is reachable with each interval off by up to 1 ms.
+function rs_uniform_timing(p_a, p_b, p_c) {
+    cr_lo = rs_cr_f(p_a - 1, p_b + 1, p_c - 1);
+    cr_hi = rs_cr_f(p_a + 1, p_b - 1, p_c + 1);
+    if (cr_lo <= 0 && cr_hi >= 0) {
+        return 1;
+    }
+    return 0;
+}
+
+function rs_cr_f(p_a, p_b, p_c) {
+    return 3 * (p_a + p_b) * (p_b + p_c) - 4 * p_b * (p_a + p_b + p_c);
+}
+
+// cos of an integer angle in degrees, Q14.
+function rs_cos(p_deg) {
+    p_deg = p_deg % 360;
+    if (p_deg < 0) {
+        p_deg = p_deg + 360;
+    }
+    if (p_deg <= 90) {
+        return RS_COS[p_deg];
+    }
+    if (p_deg <= 180) {
+        return -RS_COS[180 - p_deg];
+    }
+    if (p_deg <= 270) {
+        return -RS_COS[p_deg - 180];
+    }
+    return RS_COS[360 - p_deg];
+}
+
+// Division helpers: the divisor is always positive and dividends of either
+// sign are handled explicitly, so truncating division never leaks through.
+function rs_floor_div(p_a, p_b) {
+    if (p_a >= 0) {
+        return p_a / p_b;
+    }
+    return -((-p_a + p_b - 1) / p_b);
+}
+
+function rs_ceil_div(p_a, p_b) {
+    if (p_a >= 0) {
+        return (p_a + p_b - 1) / p_b;
+    }
+    return -((-p_a) / p_b);
+}
+
+function rs_rdiv(p_a, p_b) {
+    if (p_a >= 0) {
+        return (p_a + p_b / 2) / p_b;
+    }
+    return -((-p_a + p_b / 2) / p_b);
+}
